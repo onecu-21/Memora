@@ -1,0 +1,4 @@
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+abstract interface class SecretStore { Future<void> write(String key, String value); Future<String?> read(String key); Future<void> delete(String key); }
+class PlatformSecretStore implements SecretStore { const PlatformSecretStore([this.storage = const FlutterSecureStorage()]); final FlutterSecureStorage storage; @override Future<void> delete(String key) => storage.delete(key: key); @override Future<String?> read(String key) => storage.read(key: key); @override Future<void> write(String key, String value) => storage.write(key: key, value: value); }
+class MemorySecretStore implements SecretStore { final Map<String,String> _values = {}; @override Future<void> delete(String key) async => _values.remove(key); @override Future<String?> read(String key) async => _values[key]; @override Future<void> write(String key, String value) async => _values[key] = value; }
