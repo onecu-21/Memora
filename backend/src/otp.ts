@@ -1,0 +1,5 @@
+export interface OtpRecord { email: string; hash: string; expiresAt: number; attempts: number; used: boolean }
+const bytesToHex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
+export async function hashOtp(email: string, code: string, secret: string): Promise<string> { const data = new TextEncoder().encode(`${email.toLowerCase()}:${code}:${secret}`); return bytesToHex(await crypto.subtle.digest('SHA-256', data)); }
+export function generateOtp(random = crypto.getRandomValues(new Uint32Array(1))[0]): string { return (random % 1_000_000).toString().padStart(6, '0'); }
+export async function verifyOtp(record: OtpRecord, email: string, code: string, secret: string, now = Date.now()): Promise<boolean> { if (record.used || record.expiresAt <= now || record.attempts >= 5 || !/^\d{6}$/.test(code)) return false; record.attempts++; const supplied = await hashOtp(email, code, secret); if (supplied !== record.hash) return false; record.used = true; return true; }
