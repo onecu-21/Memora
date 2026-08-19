@@ -4,188 +4,391 @@ on:
   push:
     branches:
       - main
+
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Stable release tag (must match vX.Y.Z exactly)
+        description: "Stable release tag (must match vX.Y.Z exactly)"
         required: true
         type: string
 
 permissions:
   contents: write
 
-# Serializing the whole pipeline prevents two main pushes from selecting the same
-# alpha number. A newer run waits rather than cancelling a partially built release.
+# Prevent two main pushes from selecting the same alpha-N.
+# Runs wait for the previous release pipeline instead of cancelling it.
 concurrency:
   group: memora-release
   cancel-in-progress: false
 
-env:
-  FLUTTER_VERSION: 3.24.5
 
 jobs:
+  # ------------------------------------------------------------
+  # Select release version
+  # ------------------------------------------------------------
+
   prepare:
-    name: Select and validate release tag
+    name: Select release version
     runs-on: ubuntu-latest
+
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       prerelease: ${{ steps.release.outputs.prerelease }}
+
     steps:
-      - name: Check out source and tags
+      - name: Checkout repository and tags
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Select release
+      - name: Select release tag
         id: release
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_TAG: ${{ inputs.release_tag }}
+          CURRENT_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
 
           if [[ "$EVENT_NAME" == "push" ]]; then
-            latest="$({ git tag --list 'alpha-[0-9]*' || true; } \
-              | sed -nE 's/^alpha-([0-9]+)$/\1/p' \
-              | sort -n \
-              | tail -n 1)"
+
+            # Every push to main creates the next alpha-N.
+            latest="$(
+              {
+                git tag --list 'alpha-[0-9]*' || true
+              } |
+              sed -nE 's/^alpha-([0-9]+)$/\1/p' |
+              sort -n |
+              tail -n 1
+            )"
+
             next=$(( ${latest:-0} + 1 ))
+
             tag="alpha-$next"
             prerelease=true
-          else
-            tag="$REQUESTED_TAG"
-            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "Stable release tags must match vX.Y.Z exactly." >&2
+
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+
+            # Stable releases may only be manually created from main.
+            if [[ "$CURRENT_REF" != "refs/heads/main" ]]; then
+              echo "Stable releases must be created from the main branch." >&2
               exit 1
             fi
+
+            tag="$REQUESTED_TAG"
+
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Stable release tags must match exactly: vX.Y.Z" >&2
+              echo "Example: v1.0.0" >&2
+              exit 1
+            fi
+
             prerelease=false
+
+          else
+            echo "Unsupported event: $EVENT_NAME" >&2
+            exit 1
           fi
 
+          # Refuse to overwrite an existing tag.
           if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-            echo "Release tag $tag already exists." >&2
+            echo "Tag $tag already exists." >&2
             exit 1
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "Selected $tag (prerelease=$prerelease)"
+
+          echo "Selected release:"
+          echo "  tag=$tag"
+          echo "  prerelease=$prerelease"
+
+
+  # ------------------------------------------------------------
+  # Verify Dart/Flutter project
+  # ------------------------------------------------------------
+
+  verify:
+    name: Verify Flutter project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Resolve packages
+        run: flutter pub get
+
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+
+  # ------------------------------------------------------------
+  # Android
+  # ------------------------------------------------------------
 
   android:
     name: Build Android
-    needs: prepare
+    needs:
+      - prepare
+      - verify
+
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: Complete Android runner
-        run: flutter create --platforms=android --org app.memora .
+
+      # Repository name may be "Memora", but Dart package names
+      # must be lowercase. Force project name to "memora".
+      #
+      # --org app + --project-name memora
+      # => Android application id: app.memora
+      - name: Complete Android platform runner
+        run: >
+          flutter create
+          --project-name memora
+          --platforms=android
+          --org app
+          .
+
       - name: Resolve packages
         run: flutter pub get
-      - name: Analyze
-        run: flutter analyze
-      - name: Test
-        run: flutter test
+
       - name: Build release APK
         run: flutter build apk --release
-      - name: Name Android artifact
-        run: cp build/app/outputs/flutter-apk/app-release.apk memora-${{ needs.prepare.outputs.tag }}-android.apk
-      - name: Upload Android artifact
+
+      - name: Build release App Bundle
+        run: flutter build appbundle --release
+
+      - name: Rename Android APK
+        shell: bash
+        run: |
+          cp \
+            build/app/outputs/flutter-apk/app-release.apk \
+            "memora-${{ needs.prepare.outputs.tag }}-android.apk"
+
+      - name: Rename Android AAB
+        shell: bash
+        run: |
+          cp \
+            build/app/outputs/bundle/release/app-release.aab \
+            "memora-${{ needs.prepare.outputs.tag }}-android.aab"
+
+      - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: memora-android
-          path: memora-${{ needs.prepare.outputs.tag }}-android.apk
+          name: memora-${{ needs.prepare.outputs.tag }}-android
           if-no-files-found: error
+          path: |
+            memora-${{ needs.prepare.outputs.tag }}-android.apk
+            memora-${{ needs.prepare.outputs.tag }}-android.aab
+
+
+  # ------------------------------------------------------------
+  # Linux
+  # ------------------------------------------------------------
 
   linux:
     name: Build Linux
-    needs: prepare
+    needs:
+      - prepare
+      - verify
+
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libgtk-3-dev \
+            liblzma-dev \
+            libsecret-1-dev
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: Complete Linux runner
-        run: flutter create --platforms=linux --org app.memora .
+
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: Complete Linux platform runner
+        run: >
+          flutter create
+          --project-name memora
+          --platforms=linux
+          --org app
+          .
+
       - name: Resolve packages
         run: flutter pub get
-      - name: Build Linux bundle
+
+      - name: Build Linux release
         run: flutter build linux --release
+
       - name: Package Linux bundle
-        run: tar -C build/linux/x64/release/bundle -czf memora-${{ needs.prepare.outputs.tag }}-linux-x64.tar.gz .
+        shell: bash
+        run: |
+          tar \
+            -C build/linux/x64/release/bundle \
+            -czf "memora-${{ needs.prepare.outputs.tag }}-linux-x64.tar.gz" \
+            .
+
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: memora-linux
-          path: memora-${{ needs.prepare.outputs.tag }}-linux-x64.tar.gz
+          name: memora-${{ needs.prepare.outputs.tag }}-linux
           if-no-files-found: error
+          path: memora-${{ needs.prepare.outputs.tag }}-linux-x64.tar.gz
+
+
+  # ------------------------------------------------------------
+  # Windows
+  # ------------------------------------------------------------
 
   windows:
     name: Build Windows
-    needs: prepare
+    needs:
+      - prepare
+      - verify
+
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: Complete Windows runner
-        run: flutter create --platforms=windows --org app.memora .
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Complete Windows platform runner
+        run: >
+          flutter create
+          --project-name memora
+          --platforms=windows
+          --org app
+          .
+
       - name: Resolve packages
         run: flutter pub get
-      - name: Build Windows bundle
+
+      - name: Build Windows release
         run: flutter build windows --release
+
+      # Flutter Windows requires the complete Release directory,
+      # not only memora.exe.
       - name: Package Windows bundle
         shell: pwsh
-        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath memora-${{ needs.prepare.outputs.tag }}-windows-x64.zip
+        run: |
+          Compress-Archive `
+            -Path "build/windows/x64/runner/Release/*" `
+            -DestinationPath "memora-${{ needs.prepare.outputs.tag }}-windows-x64.zip"
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: memora-windows
-          path: memora-${{ needs.prepare.outputs.tag }}-windows-x64.zip
+          name: memora-${{ needs.prepare.outputs.tag }}-windows
           if-no-files-found: error
+          path: memora-${{ needs.prepare.outputs.tag }}-windows-x64.zip
+
+
+  # ------------------------------------------------------------
+  # GitHub Release
+  # ------------------------------------------------------------
 
   release:
-    name: Publish GitHub release
-    needs: [prepare, android, linux, windows]
+    name: Publish GitHub Release
+
+    needs:
+      - prepare
+      - android
+      - linux
+      - windows
+
     runs-on: ubuntu-latest
+
     steps:
       - name: Download platform artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
           merge-multiple: true
-      - name: Create release and tag
+
+      - name: Show release files
+        shell: bash
+        run: |
+          find release-artifacts -maxdepth 2 -type f -print
+
+      - name: Create GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+
           TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ github.sha }}
+
         run: |
           set -euo pipefail
-          args=("$TAG" release-artifacts/* --repo "$REPOSITORY" --target "$TARGET_SHA" --generate-notes --title "Memora $TAG")
+
+          args=(
+            "$TAG"
+            release-artifacts/*
+            --repo "$REPOSITORY"
+            --target "$TARGET_SHA"
+            --title "Memora $TAG"
+            --generate-notes
+          )
+
           if [[ "$PRERELEASE" == "true" ]]; then
             args+=(--prerelease)
           fi
+
           gh release create "${args[@]}"
